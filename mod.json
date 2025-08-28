@@ -1,9 +1,15 @@
 {
-  "name": "camila314.pathfinder-single",
-  "version": "1.0.0",
-  "id": "camila314.pathfinder-single",
-  "author": "Asher",
-  "description": "Single-file Pathfinder mod (self-contained). Attempts live extraction then falls back to level.txt. Build with Geode.",
-  "license": "BSL-1.0",
-  "entry": "src/main.cpp"
+	"id": "camila314.pathfinder",
+	"gd": {
+		"win": "2.2074",
+		"android": "2.2074",
+		"mac": "2.2074",
+		"ios": "2.2074"
+	},
+	"geode": "4.4.0",
+	"name": "Pathfinder-single",
+	"developer": "entity12208",
+	"version": "v1.0.0-beta.19",
+	"description": "Beat levels automatically!",
+	"tags": ["offline", "gameplay", "utility"]
 }
