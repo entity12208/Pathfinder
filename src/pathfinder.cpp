@@ -15,39 +15,44 @@ std::vector<uint8_t> pathfind(const std::string& lvlString, std::atomic_bool& st
     level.parse();
 
     GDPhysicsSimulator sim(&level);
+
     std::vector<GDPlayerState> bestReplay;
     int bestFrame = 0;
+    std::vector<GDPlayerState> replayHistory;
 
     std::random_device rd;
     std::mt19937 rng(rd());
 
-    // Main simulation loop
+    float levelLength = level.settings.count("levelLength") ? level.settings["levelLength"] : 1.0f;
+    if (levelLength <= 0.0f) levelLength = 1.0f;
+
     while (!stop) {
+        if (level.objects.empty() || sim.players.empty())
+            break;
+
         std::vector<bool> input(level.objects.size(), false);
-        // Randomly generate inputs, or use a smarter search (e.g. A*, genetic algorithms)
-        for (auto& player : sim.players) {
-            input[0] = rng() % 2; // Placeholder, replace with proper logic
+        for (size_t i = 0; i < input.size(); ++i) {
+            input[i] = rng() % 2;
         }
         sim.runFrame(input);
 
-        // Save best run so far
-        if (sim.players[0].x > bestFrame) {
+        // Store replay history if needed
+        replayHistory.insert(replayHistory.end(), sim.players.begin(), sim.players.end());
+
+        if (!sim.players.empty() && sim.players[0].x > bestFrame) {
             bestFrame = sim.players[0].x;
             bestReplay = sim.players;
         }
 
-        // Progress callback
-        if (callback) {
-            float progress = std::min((sim.players[0].x / level.settings["levelLength"]) * 100, 100.0f);
+        if (callback && !sim.players.empty()) {
+            float progress = std::min((sim.players[0].x / levelLength) * 100, 100.0f);
             callback(progress);
         }
 
-        // Check for completion
-        if (sim.players[0].x >= level.settings["levelLength"])
+        if (!sim.players.empty() && sim.players[0].x >= levelLength)
             break;
     }
 
-    // Export macro
-    std::string macroString = MacroExporter::generateMacroString(bestReplay);
+    std::string macroString = MacroExporter::generateMacroString(bestReplay); // or replayHistory, if full replay needed
     return std::vector<uint8_t>(macroString.begin(), macroString.end());
 }
