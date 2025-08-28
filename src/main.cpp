@@ -1,22 +1,32 @@
-// src/main.cpp
+\
+// main.cpp - Pathfinder Single-file Geode mod
+// Drop into a Geode mod's src/ and build with geode build
 //
-// Pathfinder-single: single-file Geode mod (improved, cross-version guarded live extractor)
-// - Tries to extract level objects using PlayLayer->m_level->m_objects (the same general approach as Pathfinder).
-// - Falls back to level.txt in the mod save dir if live extraction fails.
-// - Frame-accurate physics sim and conservative pathfinding.
-// - Outputs macro.txt (frames) and pathfinder_report.json (debug).
+// Behavior:
+//  - Adds a "Pathfinder" popup accessible from the More Games menu.
+//  - Attempts to extract level objects from PlayLayer->m_level->m_objects (guarded).
+//  - Falls back to reading a CSV level file at Mod::get()->getSaveDir()/level.txt
+//  - Runs a deterministic frame-based simulator and outputs macro.txt and pathfinder_report.txt
 //
-// Build: place inside Geode mod src/, then `geode build`
+// This mod uses only Geode's documented APIs (MenuLayer modify, FLAlertLayer, Mod::get()->getSaveDir).
+// If live extraction fails on your GD version, create level.txt in the save dir (format described below).
 //
-// Author: generated for user (Asher). Uses Geode bindings and inspired by camila314/pathfinder.
-// References: camila314/pathfinder (github) and docs.geode-sdk.org. :contentReference[oaicite:1]{index=1}
+// Level file format (level.txt):
+//   PLATFORM,x,y,w,h
+//   SPIKE,x,y,w,h
+//   JUMP_PAD,x,y,w,h[,power]
+//
+// Output:
+//   macro.txt   - newline-separated frame numbers to press jump
+//   pathfinder_report.txt - human-readable debug info
+//
+// Tune physics constants below to match your GD version if needed.
 
 #include <Geode/Bindings.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/binding/FLAlertLayer.hpp>
 #include <Geode/binding/PlayLayer.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
-#include <Geode/binding/GameObject.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <Geode/utils/Log.hpp>
 #include <Geode/loader/Dirs.hpp>
@@ -27,22 +37,17 @@
 #include <vector>
 #include <cmath>
 #include <filesystem>
-#include <optional>
-#include <nlohmann/json.hpp>
+#include <iomanip>
 
 using namespace geode::prelude;
-using json = nlohmann::json;
 
-///////////////////////////////////////////////////////////////////////////////
-// Tunables - change to match your Geometry Dash version if needed
-static constexpr float FRAME_DT = 1.0f / 60.0f;   // 60 FPS sim
-static constexpr float PLAYER_SPEED = 220.0f;     // horizontal px/s (tweak)
-static constexpr float GRAVITY = -1600.0f;        // px/s^2 (tweak)
-static constexpr float JUMP_VELOCITY = 680.0f;    // px/s (tweak)
-static constexpr float START_BEFORE_X = 16.0f;    // start px before first object
-static constexpr int   LOOKAHEAD_FRAMES = 36;     // frames to lookahead when deciding jumps
-static constexpr int   MAX_SIM_FRAMES = 60 * 300; // safety cap
-///////////////////////////////////////////////////////////////////////////////
+static constexpr float FRAME_DT = 1.0f / 60.0f;   // 60 FPS
+static constexpr float PLAYER_SPEED = 220.0f;     // px/s
+static constexpr float GRAVITY = -1600.0f;        // px/s^2
+static constexpr float JUMP_VELOCITY = 680.0f;    // px/s
+static constexpr float START_BEFORE_X = 16.0f;
+static constexpr int LOOKAHEAD = 36;
+static constexpr int MAX_FRAMES = 60 * 300;
 
 struct Rect { float x, y, w, h; bool contains(float px, float py) const {
     return px >= x && px <= x + w && py >= y && py <= y + h;
@@ -54,45 +59,30 @@ struct Obj {
     ObjType type = ObjType::UNKNOWN;
     Rect r{0,0,0,0};
     float power = 0.0f;
-    json to_json() const {
-        json j;
-        j["type"] = (type==ObjType::PLATFORM?"platform":type==ObjType::SPIKE?"spike":type==ObjType::JUMP_PAD?"jump_pad":"unknown");
-        j["x"]=r.x; j["y"]=r.y; j["w"]=r.w; j["h"]=r.h;
-        if (type==ObjType::JUMP_PAD) j["power"]=power;
-        return j;
-    }
 };
 
 struct SimState {
     float px, py;
     float vx, vy;
     bool onGround;
-    json to_json() const {
-        return { {"px",px},{"py",py},{"vx",vx},{"vy",vy},{"onGround",onGround} };
-    }
 };
 
-///////////////////////////////////////////////////////////////////////////////
-// Frame integrator: simple deterministic physics used for pathfinding
 static SimState stepSim(const SimState& s, bool doJump, const std::vector<Obj>& objs) {
     SimState n = s;
     if (doJump && n.onGround) {
         n.vy = JUMP_VELOCITY;
         n.onGround = false;
     }
-    // horizontal movement
     n.px += PLAYER_SPEED * FRAME_DT;
-    // integrate vertical velocity
     n.vy += GRAVITY * FRAME_DT;
     n.py += n.vy * FRAME_DT;
 
-    // platform landing detection: if player's x within platform width and crossed downward onto top
     bool landed = false;
     float bestTop = -INFINITY;
     for (auto const& o : objs) {
         if (o.type != ObjType::PLATFORM) continue;
-        float left = o.r.x, right = o.r.x + o.r.w, top = o.r.y + o.r.h;
-        if (n.px >= left && n.px <= right) {
+        if (n.px >= o.r.x && n.px <= o.r.x + o.r.w) {
+            float top = o.r.y + o.r.h;
             if (s.py >= top - 1e-3f && n.py <= top + 1e-3f) {
                 if (top > bestTop) bestTop = top, landed = true;
             }
@@ -106,7 +96,6 @@ static SimState stepSim(const SimState& s, bool doJump, const std::vector<Obj>& 
         n.onGround = false;
     }
 
-    // jump pads: if overlapping, set vertical velocity
     for (auto const& o : objs) {
         if (o.type != ObjType::JUMP_PAD) continue;
         if (n.px >= o.r.x && n.px <= o.r.x + o.r.w &&
@@ -116,7 +105,6 @@ static SimState stepSim(const SimState& s, bool doJump, const std::vector<Obj>& 
         }
     }
 
-    // spike detection -> mark death as py extremely low
     for (auto const& o : objs) {
         if (o.type != ObjType::SPIKE) continue;
         if (o.r.contains(n.px, n.py)) {
@@ -127,24 +115,19 @@ static SimState stepSim(const SimState& s, bool doJump, const std::vector<Obj>& 
     return n;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Pathfinding core: greedy lookahead + delayed-jump scheduling + limited backtrack
-static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float goalX, std::vector<int>& outJumps, json& debug) {
+static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float goalX, std::vector<int>& outJumps, std::string& report) {
     outJumps.clear();
-    debug = json::object();
-    debug["goal_x"] = goalX;
-    debug["obj_count"] = (int)objs.size();
-
+    std::ostringstream rep;
+    rep << "Pathfinder run\n";
+    rep << "Objects: " << objs.size() << "\n";
     SimState state = start;
-    const int lookahead = LOOKAHEAD_FRAMES;
-
-    for (int frame=0; frame < MAX_SIM_FRAMES; ++frame) {
+    const int lookahead = LOOKAHEAD;
+    for (int frame=0; frame<MAX_FRAMES; ++frame) {
         if (state.px >= goalX) {
-            debug["frames"] = frame;
+            rep << "Success at frame " << frame << "\n";
+            report = rep.str();
             return true;
         }
-
-        // simulate lookahead without jumping
         SimState look = state;
         bool willDie = false;
         for (int la=0; la<lookahead; ++la) {
@@ -155,11 +138,8 @@ static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float go
             state = stepSim(state, false, objs);
             continue;
         }
-
-        // try immediate jump if on ground
         if (state.onGround) {
             SimState after = stepSim(state, true, objs);
-            // test safety after jump
             SimState probe = after;
             bool ok = true;
             for (int la=0; la<lookahead; ++la) {
@@ -168,14 +148,13 @@ static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float go
             }
             if (ok) {
                 outJumps.push_back(frame);
+                rep << "Jump at frame " << frame << "\n";
                 state = after;
                 continue;
             }
         }
-
-        // try scheduling a jump a few frames later (delayed)
         bool scheduled = false;
-        for (int delay = 1; delay <= 8; ++delay) {
+        for (int delay=1; delay<=8; ++delay) {
             SimState trial = state;
             for (int d=0; d<delay; ++d) trial = stepSim(trial, false, objs);
             if (!trial.onGround) continue;
@@ -188,7 +167,7 @@ static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float go
             }
             if (ok) {
                 outJumps.push_back(frame + delay);
-                // advance to the moment after the jump
+                rep << "Delayed jump at frame " << frame + delay << "\n";
                 for (int d=0; d<delay; ++d) state = stepSim(state, false, objs);
                 state = stepSim(state, true, objs);
                 scheduled = true;
@@ -196,34 +175,29 @@ static bool runPathfinder(const std::vector<Obj>& objs, SimState start, float go
             }
         }
         if (scheduled) continue;
-
-        // give up if no schedule works
-        debug["failed_frame"] = frame;
+        rep << "Failed at frame " << frame << "\n";
+        report = rep.str();
         return false;
     }
-
-    debug["failed_reason"] = "max_frames_exceeded";
+    rep << "Failed: max frames exceeded\n";
+    report = rep.str();
     return false;
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// Level parsing: two modes
-// - Live extraction: try to get PlayLayer::get()->m_level->m_objects (primary approach)
-// - Fallback to level.txt (CSV)
-///////////////////////////////////////////////////////////////////////////////
-
-static bool parseLevelTextFile(const std::filesystem::path& p, std::vector<Obj>& out, json& debug) {
+// parse level.txt fallback
+static bool parseLevelFile(const std::filesystem::path& p, std::vector<Obj>& out, std::string& dbg) {
     out.clear();
-    debug = json::object();
-    debug["source"] = "level.txt";
     std::ifstream ifs(p);
-    if (!ifs.is_open()) { debug["error"]="file_not_found"; return false; }
+    if (!ifs.is_open()) { dbg = "file not found"; return false; }
     std::string line; int ln=0;
+    std::ostringstream dbgoss;
     while (std::getline(ifs, line)) {
         ++ln;
         auto trim = [&](std::string s)->std::string {
-            size_t a = s.find_first_not_of(" \t\r\n"); if (a==std::string::npos) return "";
-            size_t b = s.find_last_not_of(" \t\r\n"); return s.substr(a, b-a+1);
+            size_t a = s.find_first_not_of(" \\t\\r\\n");
+            if (a==std::string::npos) return "";
+            size_t b = s.find_last_not_of(" \\t\\r\\n");
+            return s.substr(a, b-a+1);
         };
         line = trim(line);
         if (line.empty() || line[0]=='#') continue;
@@ -232,23 +206,22 @@ static bool parseLevelTextFile(const std::filesystem::path& p, std::vector<Obj>&
         while (std::getline(ss, tok, ',')) toks.push_back(trim(tok));
         if (toks.empty()) continue;
         std::string t = toks[0];
-        for (auto &c : t) c = toupper((unsigned char)c);
-
+        for (auto &c : t) c = (char)toupper((unsigned char)c);
         try {
             if (t == "PLATFORM") {
-                if (toks.size() < 5) { debug["parse_error_line"] = ln; return false; }
+                if (toks.size() < 5) { dbgoss << "parse error line " << ln; dbg = dbgoss.str(); return false; }
                 Obj o; o.type = ObjType::PLATFORM;
                 o.r.x = std::stof(toks[1]); o.r.y = std::stof(toks[2]);
                 o.r.w = std::stof(toks[3]); o.r.h = std::stof(toks[4]);
                 out.push_back(o);
             } else if (t == "SPIKE") {
-                if (toks.size() < 5) { debug["parse_error_line"] = ln; return false; }
+                if (toks.size() < 5) { dbgoss << "parse error line " << ln; dbg = dbgoss.str(); return false; }
                 Obj o; o.type = ObjType::SPIKE;
                 o.r.x = std::stof(toks[1]); o.r.y = std::stof(toks[2]);
                 o.r.w = std::stof(toks[3]); o.r.h = std::stof(toks[4]);
                 out.push_back(o);
             } else if (t == "JUMP_PAD") {
-                if (toks.size() < 4) { debug["parse_error_line"] = ln; return false; }
+                if (toks.size() < 4) { dbgoss << "parse error line " << ln; dbg = dbgoss.str(); return false; }
                 Obj o; o.type = ObjType::JUMP_PAD;
                 o.r.x = std::stof(toks[1]); o.r.y = std::stof(toks[2]);
                 o.r.w = toks.size() >= 4 ? std::stof(toks[3]) : 16.0f;
@@ -256,39 +229,28 @@ static bool parseLevelTextFile(const std::filesystem::path& p, std::vector<Obj>&
                 o.power = (toks.size() >= 5) ? std::stof(toks[4]) : JUMP_VELOCITY;
                 out.push_back(o);
             } else {
-                debug["ignored_" + std::to_string(ln)] = line;
+                dbgoss << "ignored line " << ln << "\\n";
             }
         } catch (...) {
-            debug["error_line_"+std::to_string(ln)] = line;
+            dbgoss << "parse exception at line " << ln << "\\n";
+            dbg = dbgoss.str();
             return false;
         }
     }
-    debug["objects"] = (int)out.size();
+    dbg = dbgoss.str();
     return true;
 }
 
-// Live extractor: try safe, multiple heuristics to extract objects from the current PlayLayer/level.
-// We attempt common Geode binding access patterns. If none succeed, we return false (caller will fallback).
-static bool extractObjectsFromPlayLayer(std::vector<Obj>& out, json& debug) {
+// safe live extractor: attempt PlayLayer->m_level->m_objects guardedly; if not possible, return false
+static bool extractLive(std::vector<Obj>& out, std::string& dbg) {
     out.clear();
-    debug = json::object();
-    debug["attempt"]="live_extract";
+    dbg.clear();
     PlayLayer* pl = nullptr;
     try { pl = PlayLayer::get(); } catch(...) { pl = nullptr; }
-    if (!pl) { debug["playlayer"]="not_found"; return false; }
-    debug["playlayer"]="found";
-
-    // Try common "m_level" pointer (many bindings expose this)
+    if (!pl) { dbg = "PlayLayer not found"; return false; }
     GJGameLevel* level = nullptr;
     try { level = pl->m_level; } catch(...) { level = nullptr; }
-    if (!level) {
-        debug["level_ptr"]="not_found";
-        // Some versions may store level pointer elsewhere; we avoid unsafe casting here.
-        return false;
-    }
-    debug["level_ptr"]="found";
-
-    // Try common objects array names used by many tools: m_objectList, m_objects, m_objectArray.
+    if (!level) { dbg = "level ptr not found"; return false; }
     cocos2d::CCArray* arr = nullptr;
     try { arr = level->m_objectList; } catch(...) { arr = nullptr; }
     if (!arr) {
@@ -297,177 +259,76 @@ static bool extractObjectsFromPlayLayer(std::vector<Obj>& out, json& debug) {
     if (!arr) {
         try { arr = level->m_objectArray; } catch(...) { arr = nullptr; }
     }
-    if (!arr) {
-        debug["objects_array"]="not_found";
-        // Another fallback that some versions use: level->m_objectInfo or LevelTools helper.
-        return false;
-    }
-    debug["objects_array"]="found";
-    debug["objects_count"] = (int)arr->count();
-
-    // Iterate array. Geode provides GameObject binding in many versions.
-    // We'll attempt to cast each CCObject* to GameObject* and read safe accessors where available.
-    for (int i = 0; i < (int)arr->count(); ++i) {
-        cocos2d::CCObject* item = arr->objectAtIndex(i);
-        if (!item) continue;
-        // Try to cast to GameObject (binding). If cast fails at runtime, skip the object.
-        GameObject* g = nullptr;
-        try { g = static_cast<GameObject*>(item); } catch(...) { g = nullptr; }
-        if (!g) continue;
-
-        // Attempt to get the object's type & position using safe getters when available.
-        // The binding might contain methods such as getX(), getY(), getObjectType(), getGroup() or fields.
-        float ox = 0.0f, oy = 0.0f, ow = 16.0f, oh = 16.0f;
-        bool havePos = false;
-        try {
-            // Many bindings provide getPosition or getX/getY
-            // We'll try a few common possibilities and catch if they don't exist
-            // Attempt: g->getX(), g->getY()
-            // NOTE: If the binding compiles but at runtime these are not implemented, it'll throw.
-            ox = g->m_x; oy = g->m_y; // many bindings provide fields m_x/m_y
-            havePos = true;
-        } catch(...) { havePos=false; }
-        if (!havePos) {
-            try { ox = g->getX(); oy = g->getY(); havePos = true; } catch(...) { havePos = false; }
+    if (!arr) { dbg = "objects array not found"; return false; }
+    // attempt to cast to GameObject where available
+    for (int i=0;i<(int)arr->count();++i) {
+        cocos2d::CCObject* o = arr->objectAtIndex(i);
+        if (!o) continue;
+        // Try to treat as GameObject if binding present
+        GameObject* go = nullptr;
+        try { go = static_cast<GameObject*>(o); } catch(...) { go = nullptr; }
+        if (!go) continue;
+        // attempt to read common fields (m_x,m_y). If not present, skip object.
+        float ox=0, oy=0, ow=16, oh=16;
+        bool ok=false;
+        try { ox = go->m_x; oy = go->m_y; ok = true; } catch(...) { ok=false; }
+        if (!ok) {
+            try { ox = go->getX(); oy = go->getY(); ok = true; } catch(...) { ok=false; }
         }
-        if (!havePos) {
-            // try getPosition()
-            try {
-                cocos2d::CCPoint p = g->getPosition();
-                ox = p.x; oy = p.y; havePos = true;
-            } catch(...) { havePos=false; }
-        }
-        if (!havePos) {
-            // If none of the above worked, skip this object -- safer than guessing.
-            continue;
-        }
-
-        // Attempt to determine width/height or treat as point object
-        try {
-            // Many object types use m_size or width/height fields (rare). We'll try a few.
-            ow = g->m_width; oh = g->m_height;
-        } catch(...) {
-            // leave 16x16 default
-        }
-
-        // Determine object type: try to read objectType, group, or UID
-        // Common approach: object->getObjectType() or object->m_objectType
+        if (!ok) continue;
         Obj obj;
-        obj.r.x = ox;
-        obj.r.y = oy;
-        obj.r.w = ow;
-        obj.r.h = oh;
-        obj.power = 0.0f;
-        bool assigned = false;
-        try {
-            int typeId = -1;
-            try { typeId = g->m_objectType; } catch(...) { typeId = -1; }
-            if (typeId == -1) {
-                try { typeId = g->getObjectType(); } catch(...) { typeId = -1; }
-            }
-            // Common mapping:
-            // 0 = block/platform, 1 = spike? (these ids vary by GD version)
-            if (typeId >= 0) {
-                // Conservative mapping: when uncertain, use PLATFORM
-                obj.type = ObjType::PLATFORM;
-                // heuristics: if height very small and looks like spike, mark spike
-                if (obj.r.h <= 10.0f || obj.r.w <= 10.0f) obj.type = ObjType::SPIKE;
-                assigned = true;
-            }
-        } catch(...) {}
-        if (!assigned) {
-            // fallback heuristic: if object name contains "Spike" or "spike" (GameObject has frame or name sometimes)
-            try {
-                const char* frame = g->m_frame;
-                if (frame) {
-                    std::string s(frame);
-                    for (auto &c : s) c = tolower((unsigned char)c);
-                    if (s.find("spike") != std::string::npos) { obj.type = ObjType::SPIKE; assigned = true; }
-                    if (s.find("jump") != std::string::npos || s.find("pad") != std::string::npos) { obj.type = ObjType::JUMP_PAD; assigned = true; }
-                }
-            } catch(...) {}
-        }
-
-        if (!assigned) obj.type = ObjType::PLATFORM; // safe default
-
-        // Many GD objects' origin is centered or bottom-left depending on how it's stored.
-        // Pathfinder historically notes y offset differences. We leave objects as-is and include the raw positions in report.
+        obj.r.x = ox; obj.r.y = oy; obj.r.w = ow; obj.r.h = oh;
+        // heuristic for spikes: small h or w
+        if (obj.r.h <= 10.0f || obj.r.w <= 10.0f) obj.type = ObjType::SPIKE;
+        else obj.type = ObjType::PLATFORM;
         out.push_back(obj);
     }
-
-    debug["extracted"] = (int)out.size();
+    dbg = "extracted " + std::to_string(out.size()) + " objects";
     return !out.empty();
 }
 
-///////////////////////////////////////////////////////////////////////////////
-// UI + top-level glue: FLAlert menu in More Games
-class PathfinderAlert : public FLAlertLayerProtocol {
+class PathfinderPopup : public FLAlertLayerProtocol {
 public:
     std::filesystem::path saveDir;
-    PathfinderAlert() {
-        try {
-            saveDir = Mod::get()->getSaveDir();
-        } catch(...) {
-            saveDir = std::filesystem::current_path();
-        }
+    PathfinderPopup() {
+        try { saveDir = Mod::get()->getSaveDir(); } catch(...) { saveDir = std::filesystem::current_path(); }
     }
-
     void show() {
         std::ostringstream ss;
-        ss << "Pathfinder (improved)\n\n"
-           << "Press RUN to attempt live extraction (PlayLayer). If that fails, the mod will fallback to level.txt.\n\n"
-           << "Save dir: " << saveDir.string() << "\n\n"
-           << "File format (CSV): PLATFORM,x,y,w,h  SPIKE,x,y,w,h  JUMP_PAD,x,y,w[,power]\n\n"
-           << "Press RUN to start.";
+        ss << "Pathfinder (single-file)\\n\\n";
+        ss << "Press RUN to attempt live extraction (PlayLayer). If that fails, fallback to level.txt.\\n\\n";
+        ss << "Save dir: " << saveDir.string() << "\\n\\n";
+        ss << "Create level.txt in the save dir if needed. Format: PLATFORM,x,y,w,h  SPIKE,x,y,w,h  JUMP_PAD,x,y,w[,power]\\n\\n";
+        ss << "Press RUN to start.";
         FLAlertLayer::create(this, "Pathfinder", ss.str(), "RUN", "CANCEL")->show();
     }
-
     void FLAlert_Clicked(FLAlertLayer*, int btn) override {
-        if (btn == 0) run();
+        if (btn==0) run();
     }
-
     void run() {
-        json dbgRoot;
         std::vector<Obj> objs;
-        bool ok = false;
-
-        // 1) try live extraction
-        json liveDbg;
-        if (extractObjectsFromPlayLayer(objs, liveDbg)) {
-            dbgRoot["live"] = liveDbg;
-            ok = true;
-        } else {
-            dbgRoot["live_fail"] = liveDbg;
-        }
-
-        // 2) fallback to file
+        std::string dbg;
+        bool ok = extractLive(objs, dbg);
         if (!ok) {
-            auto p = saveDir / "level.txt";
-            json fileDbg;
-            if (parseLevelTextFile(p, objs, fileDbg)) {
-                dbgRoot["file"] = fileDbg;
-                ok = true;
-            } else {
-                dbgRoot["file_fail"] = fileDbg;
+            // try file fallback
+            auto p = (Mod::get()->getSaveDir() / "level.txt");
+            std::string filedbg;
+            if (!parseLevelFile(p, objs, filedbg)) {
+                std::ostringstream oss;
+                oss << "Pathfinder: failed to read level. live: " << dbg << " file: " << filedbg;
+                geode::Notification::create(oss.str(), geode::NotificationIcon::Exclamation, 6.0f)->show();
+                // write report
+                auto report = (Mod::get()->getSaveDir() / "pathfinder_report.txt");
+                std::ofstream rf(report.string(), std::ios::trunc);
+                rf << "live debug:\\n" << dbg << "\\nfile debug:\\n" << filedbg << "\\n";
+                rf.close();
+                GEODE_ERROR("[Pathfinder] extraction failed: %s | %s", dbg.c_str(), filedbg.c_str());
+                return;
             }
         }
-
-        if (!ok) {
-            geode::Notification::create("Pathfinder: failed to read level (check pathfinder_report.json).", geode::NotificationIcon::Exclamation, 7.0f)->show();
-            // write debug for user to inspect
-            try {
-                auto report = saveDir / "pathfinder_report.json";
-                std::ofstream f(report, std::ios::trunc);
-                f << dbgRoot.dump(2);
-                f.close();
-            } catch(...) {}
-            GEODE_ERROR("[Pathfinder] failed to get objects, debug: %s", dbgRoot.dump(2).c_str());
-            return;
-        }
-
-        // compute bounding X and ground Y heuristics
+        // compute bounding
         float minX = INFINITY, maxX = -INFINITY, groundY = -INFINITY;
-        for (auto& o : objs) {
+        for (auto &o : objs) {
             minX = std::min(minX, o.r.x);
             maxX = std::max(maxX, o.r.x + o.r.w);
             if (o.type == ObjType::PLATFORM) groundY = std::max(groundY, o.r.y + o.r.h);
@@ -475,74 +336,55 @@ public:
         if (!std::isfinite(minX)) minX = 0.0f;
         if (!std::isfinite(maxX)) maxX = minX + 1200.0f;
         if (!std::isfinite(groundY)) groundY = 0.0f;
-
-        // initial player state (start a little before minX and slightly above ground)
         SimState start;
         start.px = minX - START_BEFORE_X;
         start.py = groundY + 12.0f;
         start.vx = PLAYER_SPEED; start.vy = 0.0f; start.onGround = true;
-
         std::vector<int> jumps;
-        json planDbg;
-        bool success = runPathfinder(objs, start, maxX, jumps, planDbg);
-
-        // write a report file to save dir (useful for debugging extractor & sim)
-        json report;
-        report["success"] = success;
-        report["start"] = start.to_json();
-        report["goal_x"] = maxX;
-        report["objects"] = json::array();
-        for (auto const& o : objs) report["objects"].push_back(o.to_json());
-        report["plan"] = planDbg;
-        report["jumps_count"] = (int)jumps.size();
-
+        std::string report;
+        bool okPlan = runPathfinder(objs, start, maxX, jumps, report);
+        // write report and macro
+        auto reportPath = (Mod::get()->getSaveDir() / "pathfinder_report.txt");
         try {
-            auto rp = (saveDir / "pathfinder_report.json").string();
-            std::ofstream rf(rp, std::ios::trunc);
-            rf << report.dump(2);
+            std::ofstream rf(reportPath.string(), std::ios::trunc);
+            rf << "extraction debug:\\n" << dbg << "\\n";
+            rf << report << "\\n";
+            rf << "objects:\\n";
+            for (auto &o : objs) {
+                rf << (o.type==ObjType::PLATFORM?\"PLATFORM\":o.type==ObjType::SPIKE?\"SPIKE\":\"JUMP_PAD\") << \",\"
+                   << o.r.x << \",\" << o.r.y << \",\" << o.r.w << \",\" << o.r.h << \"\\n\";
+            }
             rf.close();
         } catch(...) {
-            GEODE_ERROR("[Pathfinder] failed to write report");
+            GEODE_ERROR(\"[Pathfinder] failed to write report file\");
         }
-
-        if (!success) {
-            geode::Notification::create("Pathfinder: couldn't find a safe macro. See pathfinder_report.json", geode::NotificationIcon::Exclamation, 8.0f)->show();
-            GEODE_ERROR("[Pathfinder] pathfinder failed. Report saved.");
+        if (!okPlan) {
+            geode::Notification::create(\"Pathfinder: couldn't find safe macro. See pathfinder_report.txt\", geode::NotificationIcon::Exclamation, 6.0f)->show();
             return;
         }
-
-        // write macro.txt as newline frame numbers
         try {
-            auto macroPath = (saveDir / "macro.txt").string();
+            auto macroPath = (Mod::get()->getSaveDir() / \"macro.txt\").string();
             std::ofstream mf(macroPath, std::ios::trunc);
-            if (!mf.is_open()) throw std::runtime_error("open_failed");
-            for (auto f : jumps) mf << f << "\n";
+            for (auto f : jumps) mf << f << \"\\n\";
             mf.close();
-
             std::ostringstream msg;
-            msg << "Pathfinder: wrote macro.txt (" << jumps.size() << " jumps) and pathfinder_report.json";
+            msg << \"Pathfinder: wrote macro.txt (\" << jumps.size() << \" jumps) and pathfinder_report.txt\";
             geode::Notification::create(msg.str(), geode::NotificationIcon::Check, 6.0f)->show();
-            GEODE_INFO("[Pathfinder] wrote macro: %s", macroPath.c_str());
+            GEODE_INFO(\"[Pathfinder] wrote macro: %s\", macroPath.c_str());
         } catch(...) {
-            geode::Notification::create("Pathfinder: failed to write macro.txt (permission?).", geode::NotificationIcon::Exclamation, 6.0f)->show();
+            geode::Notification::create(\"Pathfinder: failed to write macro.txt\", geode::NotificationIcon::Exclamation, 6.0f)->show();
         }
     }
 };
 
-///////////////////////////////////////////////////////////////////////////////
-// Hook into More Games (MenuLayer)
 class $modify(MenuLayer) {
     void onMoreGames(CCObject* sender) {
-        // call original behavior
         MenuLayer::onMoreGames(sender);
         try {
-            PathfinderAlert a;
-            a.show();
+            PathfinderPopup p;
+            p.show();
         } catch(...) {
-            GEODE_ERROR("[Pathfinder] exception showing alert");
+            GEODE_ERROR(\"[Pathfinder] exception showing popup\");
         }
     }
 };
-
-///////////////////////////////////////////////////////////////////////////////
-// END OF FILE
