@@ -7,6 +7,8 @@
 #include <atomic>
 #include <functional>
 #include <algorithm>
+#include <string>
+#include <vector>
 
 std::vector<uint8_t> pathfind(const std::string& lvlString, std::atomic_bool& stop, std::function<void(double)> callback) {
     GDLevel level(lvlString);
@@ -46,5 +48,6 @@ std::vector<uint8_t> pathfind(const std::string& lvlString, std::atomic_bool& st
     }
 
     // Export macro
-    return MacroExporter::generateMacroString(bestReplay);
+    std::string macroString = MacroExporter::generateMacroString(bestReplay);
+    return std::vector<uint8_t>(macroString.begin(), macroString.end());
 }
