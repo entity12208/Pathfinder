@@ -1,0 +1,11 @@
+{
+	"geode": "4.9.0",
+	"gd": {
+		"win": "2.2074"
+	},
+	"id": "entity12208.pathfinderv2",
+	"name": "Pathfinderv2",
+	"version": "v1.0.0",
+	"developer": "Entity12208",
+	"description": ""
+}

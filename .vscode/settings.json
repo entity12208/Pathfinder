@@ -1,0 +1,8 @@
+{
+    "files.associations": {
+        "queue": "cpp",
+        "fstream": "cpp",
+        "sstream": "cpp"
+    },
+    "git.ignoreLimitWarning": true
+}
